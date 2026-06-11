@@ -56,7 +56,7 @@
     "@jupyter/collaboration": "^5.0.0-alpha.0",
     "@jupyter/collaborative-drive": "^5.0.0-alpha.0",
     "@jupyter/docprovider": "^5.0.0-alpha.0",
-    "@jupyter/ydoc": "^4.0.0-b0",
+    "@jupyter/ydoc": "^4.0.0-b1",
     "@jupyterlab/application": "^4.6.0-beta.1",
     "@jupyterlab/apputils": "^4.7.0-beta.1",
     "@jupyterlab/codemirror": "^4.6.0-beta.1",
