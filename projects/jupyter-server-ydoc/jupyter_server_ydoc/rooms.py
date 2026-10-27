@@ -397,7 +397,10 @@ class DocumentRoom(YRoom):
             ):
                 try:
                     model = await self._file.load_content(
-                        self._file_format, self._file_type, require_hash=True
+                        self._file_format,
+                        self._file_type,
+                        require_hash=True,
+                        update_baseline=False,
                     )
                     if await self._document.aget() != model["content"]:
                         await self._document.aset(model["content"])
@@ -405,7 +408,7 @@ class DocumentRoom(YRoom):
                     # belong to the reload, rather than unsaved user edits.
                     self._document.dirty = False
                     self._document.hash = model["hash"]
-                    await self._file.acknowledge_reload()
+                    await self._file.acknowledge_reload(model)
                     reloaded = True
                     changed = False
                     self._emit(LogLevel.INFO, "overwrite", "Disk content reloaded into the room.")

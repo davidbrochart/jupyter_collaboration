@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
+from copy import deepcopy
 from http import HTTPStatus
 from logging import Logger, getLogger
 from time import time
@@ -51,6 +52,8 @@ class FileLoader:
 
         self._watcher = asyncio.create_task(self._watch_file()) if self._poll_interval else None
         self.last_modified = None
+        self._disk_hash: tuple[str | None, str] | None = None
+        self._failed_save: tuple[str, Any] | None = None
         self._outofband = False
         self.deleted = False
         self._detached_path: str | None = None
@@ -127,7 +130,12 @@ class FileLoader:
             del self._filepath_subscriptions[id]
 
     async def load_content(
-        self, format: str, file_type: str, *, require_hash: bool = False
+        self,
+        format: str,
+        file_type: str,
+        *,
+        require_hash: bool = True,
+        update_baseline: bool = True,
     ) -> dict[str, Any]:
         """
         Load the content of the file.
@@ -135,7 +143,9 @@ class FileLoader:
             Parameters:
                 format (str): File format.
                 file_type (str): Content type.
-                content (bool): Whether to load the content or not.
+                require_hash (bool): Whether to request the disk content hash.
+                update_baseline (bool): Record this disk version immediately.
+                    Reloads defer this until the content is successfully applied.
 
             Returns:
                 model (dict): A dictionary with the metadata and content of the file.
@@ -158,12 +168,14 @@ class FileLoader:
             ):
                 model["content"] = model["content"].replace("\r\n", "\n")
                 self._log.debug("Normalizing line endings for %s file on content load", self.path)
-            self.last_modified = model["last_modified"]
+            if update_baseline:
+                self._record_disk_version(model)
             return model
 
-    async def acknowledge_reload(self) -> None:
+    async def acknowledge_reload(self, model: dict[str, Any]) -> None:
         """Allow saves after disk content was successfully applied to the room."""
         async with self._lock:
+            self._record_disk_version(model)
             self._outofband = False
             self.deleted = False
 
@@ -191,7 +203,7 @@ class FileLoader:
                 model["type"] = "file"
 
             m = await self._get_disk_model(
-                path, format=model["format"], type=model["type"], content=False
+                path, format=model["format"], type=model["type"], content=False, require_hash=True
             )
             if m is None:
                 raise OutOfBandChanges
@@ -199,19 +211,19 @@ class FileLoader:
             if not m["writable"]:
                 return None
 
-            if not self._outofband and self.last_modified == m["last_modified"]:
+            if not self._outofband and self._disk_version_matches(m):
                 self._log.info("Saving file: %s", path)
                 # saving is shielded so that it cannot be cancelled
                 # otherwise it could corrupt the file
-                done_saving = asyncio.Event()
-                task = asyncio.create_task(self._save_content(model, done_saving, path))
-                saved_model = None
-                try:
-                    saved_model = await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    pass
-                await done_saving.wait()
-                return saved_model
+                task = asyncio.create_task(self._save_content(model, path))
+                while True:
+                    try:
+                        return await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        if task.cancelled():
+                            raise
+                        # Repeated autosave cancellations must not release the
+                        # lock before the write and hash baseline update finish.
             else:
                 # file changed on disk, raise an error
                 self._outofband = True
@@ -227,7 +239,7 @@ class FileLoader:
             self._outofband = True
             path = self.path
             disk = await self._get_disk_model(
-                path, format=model["format"], type=model["type"], content=True
+                path, format=model["format"], type=model["type"], content=True, require_hash=True
             )
             if disk is None:
                 return True, True
@@ -243,15 +255,38 @@ class FileLoader:
                     "content": self._notebook_with_metadata_defaults(model["content"]),
                 }
             unsaved = content != model["content"]
+            saved_before_rename = False
+            if self._failed_save is not None:
+                failed_path, saved_content = self._failed_save
+                if model["type"] == "notebook":
+                    saved_content = self._notebook_with_metadata_defaults(saved_content)
+                elif isinstance(saved_content, str):
+                    saved_content = saved_content.replace("\r\n", "\n")
+                saved_before_rename = path != failed_path and content == saved_content
             # A rename can briefly make the old path disappear, and a queued
             # poll can also notify after a save already updated our baseline.
-            # If disk has not changed since the last load/save, differences
-            # from the shared document are pending edits, not external changes.
-            if disk["last_modified"] == self.last_modified or not unsaved:
-                self.last_modified = disk["last_modified"]
+            # Compare hashes against the last disk version, not timestamps or
+            # the live document: external writes can preserve modification times,
+            # while the live document can legitimately contain unsaved edits.
+            if self._disk_version_matches(disk) or saved_before_rename or not unsaved:
+                self._record_disk_version(disk)
                 self._outofband = False
                 return False, unsaved
             return True, unsaved
+
+    def _disk_version_matches(self, model: dict[str, Any]) -> bool:
+        return self._disk_hash is not None and self._disk_hash == (
+            model.get("hash_algorithm"),
+            model.get("hash"),
+        )
+
+    def _record_disk_version(self, model: dict[str, Any]) -> None:
+        self.last_modified = model["last_modified"]
+        content_hash = model.get("hash")
+        self._disk_hash = (
+            (model.get("hash_algorithm"), content_hash) if content_hash is not None else None
+        )
+        self._failed_save = None
 
     @staticmethod
     def _notebook_with_metadata_defaults(content: dict[str, Any]) -> dict[str, Any]:
@@ -287,34 +322,33 @@ class FileLoader:
                 self._detached_path = path
                 self._outofband = True
 
-    async def _save_content(
-        self, model: dict[str, Any], done_saving: asyncio.Event, path: str
-    ) -> dict[str, Any]:
+    async def _save_content(self, model: dict[str, Any], path: str) -> dict[str, Any]:
         try:
+            return await self._save_content_at_path(model, path)
+        except Exception as save_error:
+            # Contents managers can write successfully and then fail while
+            # checkpointing a path that was just renamed. Retain that write's
+            # snapshot until we can verify it at the new path; it must not be
+            # mistaken for an external write when newer shared edits arrive.
+            self._failed_save = (path, deepcopy(model["content"]))
+            # The file may have been renamed after the metadata check in
+            # maybe_save_content but before the save reached the contents
+            # manager. Retry only if the stable file ID now resolves to a
+            # different path; errors for deleted files must still surface.
             try:
-                return await self._save_content_at_path(model, path)
-            except Exception as save_error:
-                # The file may have been renamed after the metadata check in
-                # maybe_save_content but before the save reached the contents
-                # manager. Retry only if the stable file ID now resolves to a
-                # different path; errors for deleted files must still surface.
-                try:
-                    new_path = self.path
-                except Exception:
-                    # Deleting a file also removes its file ID. Do not replace
-                    # the original contents manager error with the path lookup
-                    # failure in that case.
-                    raise save_error from None
-                if new_path == path:
-                    raise
-                self._log.info("File moved while saving: %s -> %s; retrying", path, new_path)
-                return await self._save_content_at_path(model, new_path)
-        finally:
-            done_saving.set()
+                new_path = self.path
+            except Exception:
+                # Deleting a file also removes its file ID. Do not replace
+                # the original contents manager error with the path lookup
+                # failure in that case.
+                raise save_error from None
+            if new_path == path:
+                raise
+            self._log.info("File moved while saving: %s -> %s; retrying", path, new_path)
+            return await self._save_content_at_path(model, new_path)
 
     async def _save_content_at_path(self, model: dict[str, Any], path: str) -> dict[str, Any]:
         m = await ensure_async(self._contents_manager.save(model, path))
-        self.last_modified = m["last_modified"]
         # TODO, get rid of the extra `get` here once upstream issue:
         # https://github.com/jupyter-server/jupyter_server/issues/1453 is resolved
         model_with_hash = await ensure_async(
@@ -324,6 +358,7 @@ class FileLoader:
                 require_hash=True,
             )
         )
+        self._record_disk_version(model_with_hash)
         return {**m, "hash": model_with_hash["hash"]}
 
     async def _watch_file(self) -> None:
@@ -407,13 +442,19 @@ class FileLoader:
                 self._current_path = path
                 filepath_change = True
 
-            # Get model metadata; format and type are not need
-            model = await self._get_disk_model(path, content=False)
+            # Hash polling also catches external writes that preserve timestamps.
+            model = await self._get_disk_model(path, content=False, require_hash=True)
 
             if (
                 model is None
                 or self._outofband
-                or (self.last_modified is not None and self.last_modified != model["last_modified"])
+                or (
+                    self.last_modified is not None
+                    and (
+                        self.last_modified != model["last_modified"]
+                        or not self._disk_version_matches(model)
+                    )
+                )
             ):
                 do_notify = True
                 self._outofband = True

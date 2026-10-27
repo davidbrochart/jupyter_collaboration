@@ -117,6 +117,152 @@ async def test_identical_external_write_does_not_prompt(document):
     assert not room._document.dirty
 
 
+@pytest.mark.parametrize("behavior_on_external_change", ["ask", "overwrite"])
+@pytest.mark.parametrize("document", [False, True], indirect=True)
+@pytest.mark.parametrize("trigger", ["poll", "save", "check"])
+async def test_external_write_with_preserved_timestamp(
+    document, jp_root_dir, behavior_on_external_change, trigger
+):
+    cm, loader, room, model, path = document
+    shared = await room._document.aget()
+    if model["type"] == "file":
+        shared = "unsaved shared edits"
+        external = "external version"
+    else:
+        shared["cells"][0]["source"] = "unsaved shared edits"
+        external = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("external version")])
+    await room._document.aset(shared)
+    room._document.dirty = True
+    shared = await room._document.aget()
+    file = jp_root_dir / path
+    stat = file.stat()
+    cm.save({**model, "content": external}, path)
+    os.utime(file, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert cm.get(path, content=False)["last_modified"] == loader.last_modified
+
+    if trigger == "poll":
+        await loader.maybe_notify()
+    elif trigger == "save":
+        await room._maybe_save_document(None, save_now=True)
+    else:
+        await room._on_outofband_change()
+
+    # A save must never overwrite the external version just because its
+    # timestamp still matches the last load.
+    disk = cm.get(path)["content"]
+    assert (disk if model["type"] == "file" else disk["cells"][0]["source"]) == "external version"
+    actual = await room._document.aget()
+    if behavior_on_external_change == "ask":
+        assert actual == shared
+        assert room.outofband == {"originalPath": path}
+        assert room._document.dirty
+    else:
+        assert (actual if model["type"] == "file" else actual["cells"][0]["source"]) == (
+            "external version"
+        )
+        assert room.outofband is None
+        assert not room._document.dirty
+
+
+async def test_successful_save_updates_disk_baseline(document):
+    cm, _loader, room, _model, path = document
+    room._document.source = "first edit"
+    await room._maybe_save_document(None, save_now=True)
+    assert cm.get(path)["content"] == "first edit"
+
+    room._document.source = "second, unsaved edit"
+    room._document.dirty = True
+    await room._on_outofband_change()
+    assert room._document.source == "second, unsaved edit"
+    assert room.outofband is None
+    assert room._document.dirty
+    assert cm.get(path)["content"] == "first edit"
+
+
+@pytest.mark.parametrize("document", [False, True], indirect=True)
+async def test_identical_disk_rewrite_preserves_unsaved_edits(document, jp_root_dir):
+    _cm, loader, room, model, path = document
+    shared = await room._document.aget()
+    if model["type"] == "file":
+        shared = "unsaved shared edits"
+    else:
+        shared["cells"][0]["source"] = "unsaved shared edits"
+    await room._document.aset(shared)
+    room._document.dirty = True
+    shared = await room._document.aget()
+    file = jp_root_dir / path
+    data = file.read_bytes()
+    stat = file.stat()
+    file.write_bytes(data)
+    os.utime(file, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+
+    await loader.maybe_notify()
+
+    assert await room._document.aget() == shared
+    assert room.outofband is None
+    assert room._document.dirty
+    assert file.read_bytes() == data
+
+
+@pytest.mark.parametrize("behavior_on_external_change", ["overwrite"])
+@pytest.mark.parametrize("document", [False, True], indirect=True)
+@pytest.mark.parametrize("external_write", [False, True])
+async def test_rename_after_partial_save_preserves_new_edits(
+    document, arbitrary_fid_manager, behavior_on_external_change, external_write
+):
+    cm, loader, room, model, path = document
+    first = await room._document.aget()
+    if model["type"] == "file":
+        first = "first edit"
+        second = "second edit"
+    else:
+        first["cells"][0]["source"] = "first edit"
+        second = {**first, "cells": [{**first["cells"][0], "source": "second edit"}]}
+    new_path = "renamed-" + path
+    save = cm.save
+
+    def save_then_rename(content, save_path):
+        save(content, save_path)
+        cm.rename_file(path, new_path)
+        raise OSError("Checkpoint failed after the file moved")
+
+    with patch.object(cm, "save", side_effect=save_then_rename):
+        with pytest.raises(OSError, match="Checkpoint failed"):
+            await loader.maybe_save_content({**model, "content": first})
+    arbitrary_fid_manager.move(path, new_path)
+    if external_write:
+        external = (
+            "external version"
+            if model["type"] == "file"
+            else nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("external version")])
+        )
+        save({**model, "content": external}, new_path)
+    await room._document.aset(second)
+    room._document.dirty = True
+    second = await room._document.aget()
+
+    with patch.object(room._document, "aset", wraps=room._document.aset) as apply:
+        await loader.maybe_notify()
+        if external_write:
+            apply.assert_awaited_once()
+        else:
+            apply.assert_not_called()
+    if external_write:
+        actual = await room._document.aget()
+        assert (actual if model["type"] == "file" else actual["cells"][0]["source"]) == (
+            "external version"
+        )
+        assert room.outofband is None
+        assert not room._document.dirty
+        return
+    assert await room._document.aget() == second
+    assert room.outofband is None
+    assert room._document.dirty
+    await room._maybe_save_document(None, save_now=True)
+    disk = cm.get(new_path)["content"]
+    assert (disk if model["type"] == "file" else disk["cells"][0]["source"]) == "second edit"
+
+
 @pytest.mark.parametrize("behavior_on_external_change", ["overwrite"])
 @pytest.mark.parametrize("document", [False, True], indirect=True)
 @pytest.mark.parametrize("trigger", ["poll", "save"])
@@ -145,7 +291,12 @@ async def test_rename_gap_preserves_unsaved_changes(
     assert room.outofband == {"originalPath": path, "reason": "deleted"}
 
     if external_write:
-        cm.save(model, new_path)
+        external = (
+            "external version"
+            if model["type"] == "file"
+            else nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("external version")])
+        )
+        cm.save({**model, "content": external}, new_path)
     disk = cm.get(new_path)["content"]
     arbitrary_fid_manager.move(path, new_path)
     notices_at_path_change = []
@@ -483,7 +634,9 @@ async def test_reload_mode_preserves_content_on_read_failure(
     cm.save({**model, "content": "external"}, path)
     target, method = (loader, "load_content") if failure == "read" else (room._document, "aset")
     with patch.object(target, method, side_effect=OSError("Cannot load file")):
-        await loader.maybe_notify()
+        for _ in range(2):
+            await loader.maybe_notify()
+            assert room.outofband == {"originalPath": path}
     assert await room._document.aget() == original
     assert room.outofband == {"originalPath": path}
     assert arbitrary_fid_manager.index(path) == loader.file_id

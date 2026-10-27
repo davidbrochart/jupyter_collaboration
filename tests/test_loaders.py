@@ -199,6 +199,36 @@ async def test_FileLoader_does_not_retry_save_after_delete():
     assert cm.save_count == 1
 
 
+async def test_FileLoader_keeps_save_locked_through_repeated_cancellation():
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    cm = FakeContentsManager({"content": "original", "writable": True})
+
+    async def slow_save(model, path):
+        started.set()
+        await finish.wait()
+        return cm.model
+
+    loader = FileLoader("id", FakeFileIDManager({"id": "file.txt"}), cm)
+    await loader.load_content("text", "file")
+    with patch.object(cm, "save", side_effect=slow_save):
+        save = asyncio.create_task(
+            loader.maybe_save_content({"format": "text", "type": "file", "content": "edited"})
+        )
+        await started.wait()
+        try:
+            for _ in range(2):
+                save.cancel()
+                await asyncio.sleep(0)
+            # Polls must not observe disk while the shielded write and its hash
+            # baseline update are still running.
+            assert loader._lock.locked()
+        finally:
+            finish.set()
+            await asyncio.gather(save, return_exceptions=True)
+
+
 async def test_FileLoaderMapping_with_watcher():
     id = "file-4567"
     path = "myfile.txt"
