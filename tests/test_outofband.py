@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +25,11 @@ def behavior_on_external_change():
     return "ask"
 
 
+@pytest.fixture(params=["native", "content-only", "null", "missing"])
+def backend_hashes(request):
+    return request.param
+
+
 @pytest.fixture
 def document(
     jp_root_dir,
@@ -31,6 +37,7 @@ def document(
     request,
     jp_asyncio_loop,
     behavior_on_external_change,
+    backend_hashes,
 ):
     async def create():
         notebook = getattr(request, "param", False)
@@ -40,9 +47,27 @@ def document(
             if notebook
             else "original"
         )
+
         # Keep disk operations on the event-loop thread: pycrdt subscriptions
         # and events must not be garbage-collected by a file I/O worker thread.
-        cm = FileContentsManager(root_dir=str(jp_root_dir))
+        class TestContentsManager(FileContentsManager):
+            def get(self, *args, **kwargs):
+                if backend_hashes in ("null", "missing") or (
+                    backend_hashes == "content-only" and not kwargs.get("content", True)
+                ):
+                    kwargs["require_hash"] = False
+                result = super().get(*args, **kwargs)
+                if backend_hashes == "null":
+                    result = {**result, "hash": None, "hash_algorithm": None}
+                elif backend_hashes == "missing":
+                    result = {
+                        key: value
+                        for key, value in result.items()
+                        if key not in ("hash", "hash_algorithm")
+                    }
+                return result
+
+        cm = TestContentsManager(root_dir=str(jp_root_dir))
         model = {
             "type": "notebook" if notebook else "file",
             "format": "json" if notebook else "text",
@@ -115,6 +140,28 @@ async def test_identical_external_write_does_not_prompt(document):
     assert loader.path == path
     assert room.outofband is None
     assert not room._document.dirty
+
+
+async def test_hash_fallback_keeps_base64_representation(document, arbitrary_fid_manager):
+    cm, _loader, _room, _model, _path = document
+    path = "binary.bin"
+    content = base64.b64encode(b"text-like binary\x00").decode("ascii")
+    model = {"type": "file", "format": "base64", "content": content}
+    cm.save(model, path)
+    loader = FileLoader(arbitrary_fid_manager.index(path), arbitrary_fid_manager, cm)
+    loaded = await loader.load_content("base64", "file")
+    assert loaded["hash"] is not None
+    changed = AsyncMock()
+    loader.observe("test", changed)
+
+    # Polling does not specify a format. The fallback must still hash base64,
+    # even though this file also happens to be decodable as UTF-8 text.
+    await loader.maybe_notify()
+    changed.assert_not_called()
+    saved = await loader.maybe_save_content(model)
+    assert saved is not None
+    assert saved["hash"] == loaded["hash"]
+    assert base64.b64decode(cm.get(path, format="base64")["content"]) == base64.b64decode(content)
 
 
 @pytest.mark.parametrize("behavior_on_external_change", ["ask", "overwrite"])
@@ -593,7 +640,10 @@ async def test_reload_mode_updates_document_without_changing_id(
         assert room.outofband is None
         assert not room._document.dirty
         assert arbitrary_fid_manager.index(path) == loader.file_id
-        assert room._document.hash == cm.get(path, content=False, require_hash=True)["hash"]
+        backend_hash = cm.get(path, content=False, require_hash=True).get("hash")
+        assert room._document.hash is not None
+        if backend_hash is not None:
+            assert room._document.hash == backend_hash
         client.send.assert_not_awaited()
         # Further edits can be saved using the same file loader and ID.
         saved = await loader.maybe_save_content({**model, "content": external})

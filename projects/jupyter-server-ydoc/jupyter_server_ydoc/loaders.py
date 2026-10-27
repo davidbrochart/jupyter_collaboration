@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Callable, Coroutine
 from copy import deepcopy
 from http import HTTPStatus
@@ -53,6 +55,9 @@ class FileLoader:
         self._watcher = asyncio.create_task(self._watch_file()) if self._poll_interval else None
         self.last_modified = None
         self._disk_hash: tuple[str | None, str] | None = None
+        self._hash_from_content = False
+        self._content_format: str | None = None
+        self._content_type: str | None = None
         self._failed_save: tuple[str, Any] | None = None
         self._outofband = False
         self.deleted = False
@@ -151,14 +156,12 @@ class FileLoader:
                 model (dict): A dictionary with the metadata and content of the file.
         """
         async with self._lock:
-            model = await ensure_async(
-                self._contents_manager.get(
-                    self.path,
-                    format=format,
-                    type=file_type,
-                    content=True,
-                    require_hash=require_hash,
-                )
+            model = await self._get_model_with_hash(
+                self.path,
+                format=format,
+                type=file_type,
+                content=True,
+                require_hash=require_hash,
             )
             if (
                 file_type == "file"
@@ -288,6 +291,40 @@ class FileLoader:
         )
         self._failed_save = None
 
+    async def _get_model_with_hash(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("require_hash", True)
+        if self._hash_from_content:
+            # Keep using the same representation for the whole session, even
+            # if the backend later starts returning its own hashes.
+            kwargs = {
+                **kwargs,
+                "content": True,
+                "format": self._content_format,
+                "type": self._content_type,
+            }
+        model = await ensure_async(self._contents_manager.get(path, **kwargs))
+        if model.get("hash") is not None and not self._hash_from_content:
+            return model
+        if model.get("content") is None:
+            model = await ensure_async(
+                self._contents_manager.get(path, **{**kwargs, "content": True})
+            )
+            if model.get("hash") is not None and not self._hash_from_content:
+                return model
+        if model.get("content") is None:
+            raise ValueError(f"Contents manager returned neither content nor a hash for {path}")
+        self._hash_from_content = True
+        self._content_format = model.get("format")
+        self._content_type = model.get("type")
+        # Hash the disk snapshot, never the live shared document. Sorting keys
+        # makes JSON object ordering irrelevant; list order remains significant.
+        data = json.dumps(
+            {key: model.get(key) for key in ("type", "format", "content")},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return {**model, "hash": hashlib.sha256(data).hexdigest(), "hash_algorithm": "sha256"}
+
     @staticmethod
     def _notebook_with_metadata_defaults(content: dict[str, Any]) -> dict[str, Any]:
         metadata = dict(content.get("metadata", {}))
@@ -298,7 +335,7 @@ class FileLoader:
     async def _get_disk_model(self, path: str, **kwargs: Any) -> dict[str, Any] | None:
         """Treat disappearance of a previously loaded file as an external change."""
         try:
-            model = await ensure_async(self._contents_manager.get(path, **kwargs))
+            model = await self._get_model_with_hash(path, **kwargs)
         except HTTPError as error:
             if error.status_code != HTTPStatus.NOT_FOUND or self.last_modified is None:
                 raise
@@ -351,15 +388,17 @@ class FileLoader:
         m = await ensure_async(self._contents_manager.save(model, path))
         # TODO, get rid of the extra `get` here once upstream issue:
         # https://github.com/jupyter-server/jupyter_server/issues/1453 is resolved
-        model_with_hash = await ensure_async(
-            self._contents_manager.get(
-                path,
-                content=False,
-                require_hash=True,
-            )
+        model_with_hash = await self._get_model_with_hash(
+            path,
+            content=False,
+            require_hash=True,
         )
         self._record_disk_version(model_with_hash)
-        return {**m, "hash": model_with_hash["hash"]}
+        return {
+            **m,
+            "hash": model_with_hash["hash"],
+            "hash_algorithm": model_with_hash.get("hash_algorithm"),
+        }
 
     async def _watch_file(self) -> None:
         """
