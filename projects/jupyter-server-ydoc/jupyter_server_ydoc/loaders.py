@@ -217,19 +217,20 @@ class FileLoader:
                 self._outofband = True
                 raise OutOfBandChanges
 
-    async def has_outofband_content(self, model: dict[str, Any]) -> bool:
-        """Check disk content without applying it or creating another file."""
+    async def check_outofband_content(self, model: dict[str, Any]) -> tuple[bool, bool]:
+        """Return whether disk changed externally and whether shared edits remain unsaved."""
         async with self._lock:
             if self._detached_path is not None:
                 # Preserve the session, but refresh whether its former path exists.
                 await self._get_disk_model(self.path, content=False)
-                return True
+                return True, True
             self._outofband = True
+            path = self.path
             disk = await self._get_disk_model(
-                self.path, format=model["format"], type=model["type"], content=True
+                path, format=model["format"], type=model["type"], content=True
             )
             if disk is None:
-                return True
+                return True, True
             content = disk["content"]
             if model["type"] == "file" and isinstance(content, str):
                 content = content.replace("\r\n", "\n")
@@ -241,11 +242,16 @@ class FileLoader:
                     **model,
                     "content": self._notebook_with_metadata_defaults(model["content"]),
                 }
-            if content == model["content"]:
+            unsaved = content != model["content"]
+            # A rename can briefly make the old path disappear, and a queued
+            # poll can also notify after a save already updated our baseline.
+            # If disk has not changed since the last load/save, differences
+            # from the shared document are pending edits, not external changes.
+            if disk["last_modified"] == self.last_modified or not unsaved:
                 self.last_modified = disk["last_modified"]
                 self._outofband = False
-                return False
-            return True
+                return False, unsaved
+            return True, unsaved
 
     @staticmethod
     def _notebook_with_metadata_defaults(content: dict[str, Any]) -> dict[str, Any]:
@@ -414,16 +420,18 @@ class FileLoader:
             else:
                 self.last_modified = model["last_modified"]
 
-        if filepath_change:
-            # Notify filepath change
-            for callback in self._filepath_subscriptions.values():
-                await ensure_async(callback())
-
         if do_notify:
             # Notify out-of-band change
             # callbacks will load the file content, thus release the lock before calling them
             for callback in tuple(self._subscriptions.values()):
                 await callback()
+
+        if filepath_change:
+            # Clear any transient deletion notice before publishing the renamed
+            # path. Otherwise a save immediately after the tab title updates
+            # can still be blocked by the notice for the old path.
+            for filepath_callback in self._filepath_subscriptions.values():
+                await ensure_async(filepath_callback())
 
 
 class FileLoaderMapping:

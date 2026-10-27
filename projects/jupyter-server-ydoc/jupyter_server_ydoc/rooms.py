@@ -379,7 +379,7 @@ class DocumentRoom(YRoom):
         async with self._update_lock:
             content = await self._document.aget()
             try:
-                changed = await self._file.has_outofband_content(
+                changed, unsaved = await self._file.check_outofband_content(
                     {"format": self._file_format, "type": self._file_type, "content": content}
                 )
             except Exception as e:
@@ -388,6 +388,7 @@ class DocumentRoom(YRoom):
                 )
                 # Keep saves blocked if the external version cannot be read.
                 changed = True
+                unsaved = True
             reloaded = False
             if (
                 changed
@@ -422,7 +423,7 @@ class DocumentRoom(YRoom):
             else:
                 notice = None
                 if not reloaded:
-                    self._document.dirty = await self._document.aget() != content
+                    self._document.dirty = unsaved or await self._document.aget() != content
             if self._outofband != notice:
                 self._outofband = notice
                 message = self._external_change_message()
@@ -431,6 +432,11 @@ class DocumentRoom(YRoom):
                         await client.send(message)
                     except Exception:
                         self.log.warning("Could not send external-change status", exc_info=True)
+
+        if not changed and self._document.dirty:
+            # Changes made while the path was missing could not schedule a save.
+            # Resume autosave after clearing the notice and releasing the lock.
+            self._on_document_change("source", None)
 
     def _on_filepath_change(self) -> None:
         """
@@ -480,9 +486,8 @@ class DocumentRoom(YRoom):
         """
         Called when manual save is triggered. Helpful when autosave is turned off.
         """
-        if self._update_lock.locked():
-            return
-
+        # Manual saves must wait for the update lock in _maybe_save_document,
+        # including when autosave resumed after a rename is still running.
         self._saving_document = asyncio.create_task(
             self._maybe_save_document(self._saving_document, save_now=True)
         )

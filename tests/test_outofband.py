@@ -117,6 +117,108 @@ async def test_identical_external_write_does_not_prompt(document):
     assert not room._document.dirty
 
 
+@pytest.mark.parametrize("behavior_on_external_change", ["overwrite"])
+@pytest.mark.parametrize("document", [False, True], indirect=True)
+@pytest.mark.parametrize("trigger", ["poll", "save"])
+@pytest.mark.parametrize("external_write", [False, True])
+async def test_rename_gap_preserves_unsaved_changes(
+    document, arbitrary_fid_manager, behavior_on_external_change, trigger, external_write
+):
+    cm, loader, room, model, path = document
+    shared = await room._document.aget()
+    if model["type"] == "file":
+        shared = "unsaved shared edits"
+    else:
+        shared["cells"][0]["source"] = "unsaved shared edits"
+    await room._document.aset(shared)
+    room._document.dirty = True
+    shared = await room._document.aget()
+
+    # Reproduce the interval between the filesystem move and the file-ID
+    # manager receiving the rename event, without relying on polling delays.
+    new_path = "renamed-" + path
+    cm.rename_file(path, new_path)
+    if trigger == "poll":
+        await loader.maybe_notify()
+    else:
+        await room._maybe_save_document(None, save_now=True)
+    assert room.outofband == {"originalPath": path, "reason": "deleted"}
+
+    if external_write:
+        cm.save(model, new_path)
+    disk = cm.get(new_path)["content"]
+    arbitrary_fid_manager.move(path, new_path)
+    notices_at_path_change = []
+    loader.observe(
+        "rename-observer", AsyncMock(), lambda: notices_at_path_change.append(room.outofband)
+    )
+    with patch.object(room._document, "aset", wraps=room._document.aset) as apply:
+        await loader.maybe_notify()
+        # A notification queued before recovery must not reinterpret pending
+        # edits as external changes after the transient deletion was cleared.
+        await room._on_outofband_change()
+        if external_write:
+            apply.assert_awaited_once()
+        else:
+            apply.assert_not_called()
+
+    assert room.outofband is None
+    assert notices_at_path_change == [None]
+    assert not loader.deleted
+    actual = await room._document.aget()
+    if external_write and model["type"] == "notebook":
+        # YNotebook fills in optional notebook metadata when loading disk content.
+        assert actual["cells"] == disk["cells"]
+    else:
+        assert actual == (disk if external_write else shared)
+    assert room._document.dirty is (not external_write)
+    assert arbitrary_fid_manager.get_id(new_path) == loader.file_id
+
+    # A rename must leave pending edits saveable at the new path.
+    await room._maybe_save_document(None, save_now=True)
+    saved = cm.get(new_path)["content"]
+    if not external_write:
+        assert (saved if model["type"] == "file" else saved["cells"][0]["source"]) == (
+            "unsaved shared edits"
+        )
+    assert not room._document.dirty
+
+
+@pytest.mark.parametrize("behavior_on_external_change", ["overwrite"])
+async def test_rename_gap_resumes_autosave(
+    document, arbitrary_fid_manager, behavior_on_external_change
+):
+    cm, loader, room, _model, path = document
+    room._document.source = "unsaved shared edits"
+    room._document.dirty = True
+    new_path = "renamed-" + path
+    cm.rename_file(path, new_path)
+    await loader.maybe_notify()
+    assert room.outofband == {"originalPath": path, "reason": "deleted"}
+
+    room._save_delay = 0
+    arbitrary_fid_manager.move(path, new_path)
+    await loader.maybe_notify()
+
+    assert room._saving_document is not None
+    await asyncio.wait_for(room._saving_document, timeout=5)
+    assert cm.get(new_path)["content"] == "unsaved shared edits"
+    assert not room._document.dirty
+    assert room.outofband is None
+
+
+async def test_manual_save_waits_for_update_lock(document):
+    cm, _loader, room, _model, path = document
+    room._document.source = "unsaved shared edits"
+    room._document.dirty = True
+    async with room._update_lock:
+        save_task = room._save_to_disc()
+        assert save_task is not None
+    await asyncio.wait_for(save_task, timeout=5)
+    assert cm.get(path)["content"] == "unsaved shared edits"
+    assert not room._document.dirty
+
+
 @pytest.mark.parametrize("document", [True], indirect=True)
 async def test_touch_notebook_without_optional_metadata_does_not_prompt(
     document, jp_root_dir, arbitrary_fid_manager
